@@ -1,0 +1,247 @@
+# --- 1) Imports ---
+import os
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
+from sentence_transformers import SentenceTransformer
+from datasets import load_dataset
+from huggingface_hub import login
+import torch
+import torch.nn.functional as F
+import random
+import numpy as np
+import re
+import warnings
+warnings.filterwarnings("ignore")
+
+# --- 2) Hugging Face Login ---
+HF_TOKEN = "..."
+if HF_TOKEN:
+    login(token=HF_TOKEN)
+else:
+    print("Warning: HUGGINGFACE_TOKEN not found.")
+
+# --- 3) Reproducibility helpers ---
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+set_seed(42)
+
+# --- 4) Dataset Processing ---
+def parse_conversation(text):
+    human_pattern = r'<HUMAN>:\s*(.*?)\s*<ASSISTANT>:'
+    matches = re.findall(human_pattern, text, re.DOTALL)
+    questions = []
+    for match in matches:
+        question = re.sub(r'\s+', ' ', match.strip())
+        if 15 < len(question) < 300:
+            if not any(phrase in question.lower() for phrase in ['hello', 'hi there', 'good morning', 'thanks', 'thank you']):
+                questions.append(question)
+    return questions
+
+def load_mental_health_questions(num_samples=100):
+    try:
+        dataset = load_dataset("heliosbrahma/mental_health_chatbot_dataset", split="train")
+        print(f"Loaded dataset with {len(dataset)} examples")
+        all_questions = []
+        for example in dataset.shuffle(seed=42).select(range(min(num_samples * 5, len(dataset)))):
+            all_questions.extend(parse_conversation(example["text"]))
+        unique_questions = list(set(all_questions))
+        unique_questions.sort(key=lambda x: abs(len(x) - 100))
+        return unique_questions[:num_samples]
+    except Exception as e:
+        print(f"Error loading dataset: {e}")
+        return [
+            "What is a panic attack?",
+            "How can I manage anxiety?",
+            "I feel depressed, what should I do?",
+            "What are coping strategies for stress?",
+            "How do I know if I need therapy?"
+        ]
+
+# --- 5) Model registry ---
+models_info = {
+    "gemma2b": "advy/gemma2b-mental-health-assistant",
+    "distilgpt2": "advy/distilgpt2-mental-health-assistant",
+    "phi2": "advy/phi2-mental-health-assistant",
+    "mistral": "advy/mistral-mental-health-assistant",
+    "tinyllama": "advy/tinyllama-mental-health-assistant"
+}
+
+# --- 6) Device & dtype ---
+device = "cuda" if torch.cuda.is_available() else "cpu"
+dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+print(f"Using device: {device}, dtype: {dtype}")
+
+# --- 7) Quantization config ---
+if device == "cuda":
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=dtype
+    )
+else:
+    bnb_config = None
+
+# --- 8) Load models ---
+model_pipelines = {}
+failed_models = []
+
+for name, mid in models_info.items():
+    try:
+        print(f"Loading {name} -> {mid} ...")
+        tok = AutoTokenizer.from_pretrained(mid, use_fast=True, trust_remote_code=False)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        model_kwargs = {"trust_remote_code": False, "torch_dtype": dtype}
+        if device == "cuda" and bnb_config:
+            model_kwargs.update({"quantization_config": bnb_config, "device_map": "auto"})
+        else:
+            model_kwargs["device_map"] = "auto" if device == "cuda" else None
+        model = AutoModelForCausalLM.from_pretrained(mid, **model_kwargs)
+        pipe = pipeline("text-generation", model=model, tokenizer=tok)
+        model_pipelines[name] = pipe
+    except Exception as e:
+        print(f"[WARN] Failed to load {name}: {e}")
+        failed_models.append(name)
+        continue
+
+if len(model_pipelines) == 0:
+    raise RuntimeError("No models loaded successfully.")
+
+print(f"Successfully loaded {len(model_pipelines)} models: {list(model_pipelines.keys())}")
+if failed_models:
+    print(f"Failed to load: {failed_models}")
+
+# --- 9) Custom Weights ---
+custom_weights = [0.1, 0.1, 0.2, 0.2, 0.4]
+if len(custom_weights) != len(model_pipelines):
+    raise ValueError(f"Weight vector length {len(custom_weights)} does not match number of models {len(model_pipelines)}")
+
+# --- 10) Embedding model ---
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# --- 11) Helper SLM ---
+helper_name = list(model_pipelines.keys())[0]
+helper_pipeline = model_pipelines[helper_name]
+print(f"Helper generator model: {helper_name}")
+
+# --- 12) Text generation utils ---
+GEN_KW = dict(
+    max_new_tokens=150,
+    do_sample=True,
+    top_p=0.9,
+    temperature=0.8,
+    repetition_penalty=1.05,
+    return_full_text=False
+)
+
+def strip_echo(prompt: str, generated: str) -> str:
+    return generated[len(prompt):].strip() if generated.startswith(prompt) else generated.strip()
+
+def clean_response(response: str) -> str:
+    response = re.sub(r'\s+', ' ', response).strip()
+    sentences = response.split('.')
+    if len(sentences) > 1 and len(sentences[-1].strip()) < 10:
+        response = '.'.join(sentences[:-1]) + '.'
+    return response
+
+def get_model_output(pipe, prompt: str) -> str:
+    try:
+        formatted_prompt = f"Human: {prompt}\nAssistant: "
+        out = pipe(formatted_prompt, **GEN_KW, pad_token_id=pipe.tokenizer.eos_token_id)[0]["generated_text"]
+        return clean_response(strip_echo(formatted_prompt, out))
+    except Exception as e:
+        print(f"Error in get_model_output: {e}")
+        return ""
+
+def weighted_average_embedding(responses, weights):
+    if len(responses) != len(weights):
+        raise ValueError("responses and weights must match")
+    valid = [(r, w) for r, w in zip(responses, weights) if r.strip()]
+    if not valid:
+        raise ValueError("No valid responses")
+    responses, weights = zip(*valid)
+    embs = embedding_model.encode(list(responses), convert_to_tensor=True, normalize_embeddings=True)
+    w = torch.tensor(weights, dtype=embs.dtype, device=embs.device).unsqueeze(1)
+    weighted = torch.sum(embs * w, dim=0) / torch.sum(w)
+    return F.normalize(weighted, p=2, dim=0)
+
+# --- 13) Candidate generation & selection ---
+def generate_candidates(pipe, prompt: str, num_candidates: int = 25):
+    candidates = []
+    for i in range(num_candidates):
+        try:
+            formatted_prompt = f"Human: {prompt}\nAssistant: "
+            out = pipe(formatted_prompt, **GEN_KW, pad_token_id=pipe.tokenizer.eos_token_id)[0]["generated_text"]
+            cand = clean_response(strip_echo(formatted_prompt, out))
+            if cand.strip() and len(cand) > 10:
+                candidates.append(cand)
+        except Exception as e:
+            print(f"Error generating candidate {i}: {e}")
+    seen, unique = set(), []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+    return unique
+
+def pick_best_candidate(question, candidates, model_pipes, weights=None):
+    if not candidates:
+        return "", 0.0
+    if weights is None:
+        weights = [1.0] * len(model_pipes)
+    if len(weights) != len(model_pipes):
+        raise ValueError("Weights length must match number of models")
+    ensemble_responses, ensemble_weights = [], []
+    for (name, pipe), w in zip(model_pipes.items(), weights):
+        try:
+            resp = get_model_output(pipe, question)
+            if resp.strip():
+                ensemble_responses.append(resp)
+                ensemble_weights.append(w)
+        except Exception as e:
+            print(f"Error from {name}: {e}")
+    if not ensemble_responses:
+        return candidates[0], 0.0
+    ensemble_vec = weighted_average_embedding(ensemble_responses, ensemble_weights)
+    cand_embs = embedding_model.encode(candidates, convert_to_tensor=True, normalize_embeddings=True)
+    sims = F.cosine_similarity(cand_embs, ensemble_vec.unsqueeze(0))
+    best_idx = torch.argmax(sims).item()
+    return candidates[best_idx], sims[best_idx].item()
+
+# --- 14) Load questions ---
+print("\nLoading mental health chatbot dataset...")
+questions = load_mental_health_questions(num_samples=50)
+print(f"Loaded {len(questions)} questions")
+
+# --- 15) Run ensemble ---
+results = []
+for i, q in enumerate(questions[:10]):
+    if not q.strip():
+        continue
+    print(f"\n=== Q{i+1}/{len(questions)}: {q[:80]}... ===")
+    candidates = generate_candidates(helper_pipeline, q, num_candidates=20)
+    if not candidates:
+        print("No candidates generated, skipping...")
+        continue
+    print(f"Generated {len(candidates)} candidates")
+    best_answer, score = pick_best_candidate(q, candidates, model_pipelines, weights=custom_weights)
+    results.append({"question": q, "best_answer": best_answer, "score": score, "num_candidates": len(candidates)})
+    print(f"Best answer: {best_answer[:100]}...")
+    print(f"Similarity score: {score:.3f}")
+
+print(f"\nEvaluation complete! Processed {len(results)} questions.")
+
+# --- 16) Summary ---
+if results:
+    avg_score = sum(r["score"] for r in results) / len(results)
+    avg_candidates = sum(r["num_candidates"] for r in results) / len(results)
+    print("\n=== SUMMARY ===")
+    print(f"Models used: {list(model_pipelines.keys())}")
+    print(f"Custom Weights: {custom_weights}")
+    print(f"Average similarity score: {avg_score:.3f}")
+    print(f"Average candidates per question: {avg_candidates:.1f}")
