@@ -47,7 +47,7 @@ from huggingface_hub import login
 
 # Try login with error handling
 try:
-    login(token="CANT REVEAL THIS HERE")
+    login(token="wow")
     print("✅ HuggingFace login successful")
 except Exception as e:
     print(f"⚠️ HuggingFace login failed: {e}")
@@ -217,13 +217,17 @@ test_js_divergence_robust()
 # STEP 1: Model Info & Quantization - ALL 3 MODELS
 # ------------------------------------------
 models_info = {
-    "tinyllama": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    "mistral": "mistralai/Mistral-7B-v0.1",
-    "phi2": "microsoft/phi-2",
-    "distil2": "distilbert/distilgpt2",
-    "gemma2b": "google/gemma-2b"
-    
+     
+    "gemma2b": "advy/gemma2b-mental-health-assistant",
+    "distilgpt2": "advy/distilgpt2-mental-health-assistant",
+    "phi2": "advy/phi2-mental-health-assistant",
+    "mistral": "advy/mistral-mental-health-assistant",
+    "tinyllama": "advy/tinyllama-mental-health-assistant"
 }
+
+
+    
+
 
 model_names = list(models_info.keys())
 num_models = len(model_names)
@@ -1450,10 +1454,12 @@ fig.update_layout(
 )
 
 # Save and show the interactive plot
-fig.write_html("ParetoFairness4D_4C3.html")
+fig.write_html("ParetoFairnessFinetuned.html")
 fig.show()
 
-print("💾 Interactive 4C3 visualization saved to 'ParetoFairness4D_4C3.html'")
+print("💾 Interactive 4C3 visualization saved to 'ParetoFairnessFinetuned.html'")
+
+# Enhanced analysis section that prints both lambda and alpha values
 
 # Additional analysis: Find best trade-off solutions
 print("\n" + "="*60)
@@ -1463,33 +1469,56 @@ print("="*60)
 # Analyze different types of optimal solutions
 print("\n📊 Best Solutions by Category:")
 
+def print_solution_with_weights(name, solution_row, emoji):
+    """Helper function to print solution details including alpha weights"""
+    try:
+        # Get the optimal weights for this lambda configuration
+        weights_result = optimize_ensemble_weights_improved(
+            individual_losses, latencies, jsd_matrix, fairness_values,
+            lambdas=[solution_row['λ_pred'], solution_row['λ_cost'], 
+                    solution_row['λ_fair'], solution_row['λ_div']],
+            min_weight=0.1
+        )
+        alpha_weights = weights_result.x if weights_result.success else [0.33, 0.33, 0.34]
+    except:
+        alpha_weights = [0.33, 0.33, 0.34]  # fallback weights
+    
+    print(f"{emoji} Best {name}: L_pred={solution_row['L_pred']:.4f}, L_cost={solution_row['L_cost']:.4f}, "
+          f"L_fair={solution_row['L_fair']:.4f}, L_div={solution_row['L_div_bonus']:.4f}")
+    print(f"   λ = [{solution_row['λ_pred']:.3f}, {solution_row['λ_cost']:.3f}, "
+          f"{solution_row['λ_fair']:.3f}, {solution_row['λ_div']:.3f}]")
+    
+    # Format alpha weights with model names if available
+    model_names = ['Model1', 'Model2', 'Model3', 'Model4', 'Model5']  # Replace with actual model names
+    alpha_str = ""
+    for i, (name_model, weight) in enumerate(zip(model_names[:len(alpha_weights)], alpha_weights)):
+        alpha_str += f"{name_model}:{weight:.3f}"
+        if i < len(alpha_weights) - 1:
+            alpha_str += ", "
+    
+    print(f"   α = [{', '.join([f'{w:.3f}' for w in alpha_weights])}]")
+    print(f"   Weights: {alpha_str}")
+    print()
+
 # Best performance-focused (lowest L_pred)
 best_perf_idx = df_pareto['L_pred'].idxmin()
 best_perf = df_pareto.loc[best_perf_idx]
-print(f"🎯 Best Performance: L_pred={best_perf['L_pred']:.4f}, L_cost={best_perf['L_cost']:.4f}, "
-      f"L_fair={best_perf['L_fair']:.4f}, L_div={best_perf['L_div_bonus']:.4f}")
-print(f"   λ = [{best_perf['λ_pred']:.3f}, {best_perf['λ_cost']:.3f}, {best_perf['λ_fair']:.3f}, {best_perf['λ_div']:.3f}]")
+print_solution_with_weights("Performance", best_perf, "🎯")
 
 # Best fairness-focused (lowest L_fair)
 best_fair_idx = df_pareto['L_fair'].idxmin()
 best_fair = df_pareto.loc[best_fair_idx]
-print(f"⚖️  Best Fairness: L_pred={best_fair['L_pred']:.4f}, L_cost={best_fair['L_cost']:.4f}, "
-      f"L_fair={best_fair['L_fair']:.4f}, L_div={best_fair['L_div_bonus']:.4f}")
-print(f"   λ = [{best_fair['λ_pred']:.3f}, {best_fair['λ_cost']:.3f}, {best_fair['λ_fair']:.3f}, {best_fair['λ_div']:.3f}]")
+print_solution_with_weights("Fairness", best_fair, "⚖️")
 
 # Best cost-focused (lowest L_cost)
 best_cost_idx = df_pareto['L_cost'].idxmin()
 best_cost = df_pareto.loc[best_cost_idx]
-print(f"💰 Best Cost: L_pred={best_cost['L_pred']:.4f}, L_cost={best_cost['L_cost']:.4f}, "
-      f"L_fair={best_cost['L_fair']:.4f}, L_div={best_cost['L_div_bonus']:.4f}")
-print(f"   λ = [{best_cost['λ_pred']:.3f}, {best_cost['λ_cost']:.3f}, {best_cost['λ_fair']:.3f}, {best_cost['λ_div']:.3f}]")
+print_solution_with_weights("Cost", best_cost, "💰")
 
 # Best diversity-focused (highest L_div_bonus)
 best_div_idx = df_pareto['L_div_bonus'].idxmax()
 best_div = df_pareto.loc[best_div_idx]
-print(f"🌈 Best Diversity: L_pred={best_div['L_pred']:.4f}, L_cost={best_div['L_cost']:.4f}, "
-      f"L_fair={best_div['L_fair']:.4f}, L_div={best_div['L_div_bonus']:.4f}")
-print(f"   λ = [{best_div['λ_pred']:.3f}, {best_div['λ_cost']:.3f}, {best_div['λ_fair']:.3f}, {best_div['λ_div']:.3f}]")
+print_solution_with_weights("Diversity", best_div, "🌈")
 
 # Balanced solution (closest to centroid in normalized space)
 df_normalized = df_pareto[['L_pred', 'L_cost', 'L_fair', 'L_div_bonus']].copy()
@@ -1502,11 +1531,9 @@ df_normalized['L_div_bonus'] = 1 - df_normalized['L_div_bonus']
 distances = np.sqrt(((df_normalized - 0.5) ** 2).sum(axis=1))
 balanced_idx = distances.idxmin()
 balanced = df_pareto.loc[balanced_idx]
-print(f"⚖️  Most Balanced: L_pred={balanced['L_pred']:.4f}, L_cost={balanced['L_cost']:.4f}, "
-      f"L_fair={balanced['L_fair']:.4f}, L_div={balanced['L_div_bonus']:.4f}")
-print(f"   λ = [{balanced['λ_pred']:.3f}, {balanced['λ_cost']:.3f}, {balanced['λ_fair']:.3f}, {balanced['λ_div']:.3f}]")
+print_solution_with_weights("Balanced", balanced, "⚖️")
 
-# Summary statistics
+# Enhanced summary with weight statistics
 print(f"\n📈 Pareto Front Statistics:")
 print(f"   Total Pareto-optimal solutions: {len(df_pareto)}")
 print(f"   L_pred range: [{df_pareto['L_pred'].min():.4f}, {df_pareto['L_pred'].max():.4f}]")
@@ -1514,9 +1541,56 @@ print(f"   L_cost range: [{df_pareto['L_cost'].min():.4f}, {df_pareto['L_cost'].
 print(f"   L_fair range: [{df_pareto['L_fair'].min():.4f}, {df_pareto['L_fair'].max():.4f}]")
 print(f"   L_div_bonus range: [{df_pareto['L_div_bonus'].min():.6f}, {df_pareto['L_div_bonus'].max():.6f}]")
 
+# Additional weight analysis
+print(f"\n🔍 Ensemble Weight Analysis:")
+
+# Calculate weights for all Pareto solutions and analyze patterns
+all_weights = []
+for idx, row in df_pareto.iterrows():
+    try:
+        weights_result = optimize_ensemble_weights_improved(
+            individual_losses, latencies, jsd_matrix, fairness_values,
+            lambdas=[row['λ_pred'], row['λ_cost'], row['λ_fair'], row['λ_div']],
+            min_weight=0.1
+        )
+        weights = weights_result.x if weights_result.success else [0.2, 0.2, 0.2, 0.2, 0.2]
+        all_weights.append(weights)
+    except:
+        all_weights.append([0.2, 0.2, 0.2, 0.2, 0.2])  # fallback
+
+all_weights = np.array(all_weights)
+
+# Print weight statistics
+model_names = ['Gemma2B', 'DistilGPT2', 'Phi2', 'Mistral', 'TinyLlama']  # Replace with actual names
+for i, model_name in enumerate(model_names[:all_weights.shape[1]]):
+    avg_weight = np.mean(all_weights[:, i])
+    std_weight = np.std(all_weights[:, i])
+    min_weight = np.min(all_weights[:, i])
+    max_weight = np.max(all_weights[:, i])
+    
+    print(f"   {model_name}: avg={avg_weight:.3f} ± {std_weight:.3f}, "
+          f"range=[{min_weight:.3f}, {max_weight:.3f}]")
+
+# Find most and least utilized models
+avg_weights = np.mean(all_weights, axis=0)
+most_utilized_idx = np.argmax(avg_weights)
+least_utilized_idx = np.argmin(avg_weights)
+
+print(f"\n   Most utilized model: {model_names[most_utilized_idx]} (avg weight: {avg_weights[most_utilized_idx]:.3f})")
+print(f"   Least utilized model: {model_names[least_utilized_idx]} (avg weight: {avg_weights[least_utilized_idx]:.3f})")
+
+# Weight distribution analysis
+weight_entropy = -np.sum(avg_weights * np.log(avg_weights + 1e-10))  # Add small epsilon to avoid log(0)
+max_entropy = np.log(len(avg_weights))  # Maximum entropy for uniform distribution
+normalized_entropy = weight_entropy / max_entropy
+
+print(f"   Weight distribution entropy: {weight_entropy:.3f} (normalized: {normalized_entropy:.3f})")
+print(f"   Distribution uniformity: {normalized_entropy:.1%}")
+
 print(f"\n🎯 4D NSGA-III OPTIMIZATION WITH FAIRNESS COMPLETE!")
 print(f"   ✅ Generated {len(df_pareto)} Pareto-optimal solutions")
 print(f"   ✅ Created 4C3 interactive 3D visualizations") 
 print(f"   ✅ Identified optimal solutions for each objective")
+print(f"   ✅ Analyzed ensemble weight distributions")
 print(f"   ✅ Comprehensive trade-off analysis completed")
 print("="*60)
