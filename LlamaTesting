@@ -1,0 +1,213 @@
+import os
+import json
+import torch
+from datasets import load_dataset, Dataset
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig
+)
+from peft import PeftModel
+from huggingface_hub import login, HfApi
+from typing import Dict, List, Tuple
+from collections import Counter
+
+# ----------------------------
+# Configuration
+# ----------------------------
+HF_TOKEN = ""
+os.environ["HF_TOKEN"] = HF_TOKEN
+
+# Load LoRA adapter from the specified Hub repository
+REPO_ID = "advy/llama71b-mentalchat16k" 
+BASE_MODEL = "meta-llama/Llama-3.1-70B-Instruct"
+
+# Global configuration
+MAX_LENGTH = 2048 
+LOCAL_RESULTS_FILE = "./WORKSPACE/test_set_predictions.json"
+HF_UPLOAD_PATH = f"test_set_predictions.json" # Upload to the root of the model's repo
+
+API = HfApi()
+
+# ----------------------------
+# Dataset processing and validation (must be identical to training script)
+# ----------------------------
+def validate_conversation(input_text: str, output_text: str) -> Tuple[bool, str]:
+    # Validation logic remains identical to training
+    if not input_text or input_text.isspace():
+        return False, "Empty input"
+    if len(input_text) < 10 or len(output_text) < 20:
+        return False, "Too short"
+    if len(input_text) > 1200 or len(output_text) > 2000:
+        return False, "Too long"
+    input_words = input_text.split()
+    output_words = output_text.split()
+    if len(input_words) < 3 or len(output_words) < 8:
+        return False, "Not enough words"
+    if len(output_words) > 0:
+        most_common = Counter(output_words).most_common(1)[0][1]
+        if most_common / len(output_words) > 0.25:
+            return False, "Too repetitive"
+    if output_text.strip().lower() in ["ok", "yes", "no", "sure", "okay"]:
+        return False, "Too simple response"
+    return True, "Valid"
+
+def process_mentalchat_dataset() -> Dataset:
+    dataset = load_dataset("ShenLab/MentalChat16K", split="train")
+    SYSTEM_PROMPT = dataset[0]['instruction'].strip()
+    conversations = []
+    for ex in dataset:
+        input_text = (ex.get('input') or "").strip()
+        output_text = (ex.get('output') or "").strip()
+        ok, _ = validate_conversation(input_text, output_text)
+        if ok:
+            formatted = f"""<|system|>\n{SYSTEM_PROMPT}\n\n<|user|>\n{input_text}"""
+            target = f"""{output_text}"""
+            conversations.append({"prompt": formatted, "target": target, "instruction": input_text})
+    processed = Dataset.from_list(conversations)
+    return processed
+
+def prepare_dataset():
+    # 🚨 REVERTED: Using the original two-stage split to get the 472 examples.
+    processed = process_mentalchat_dataset()
+    # 1. Split 15% for validation/test combined
+    train_val = processed.train_test_split(test_size=0.15, seed=42, shuffle=True)
+    # 2. Split that 15% in half again (0.5 * 0.15 = 0.075 of original)
+    val_test = train_val["test"].train_test_split(test_size=0.5, seed=42, shuffle=True)
+    # The final 'test' split contains the ~472 examples
+    test_ds = val_test["test"]
+    print(f"Test/Evaluation set size (472 questions version): {len(test_ds):,}")
+    return test_ds
+# ---
+## 🚀 Model Loading from Hugging Face Hub (With VRAM Safety)
+# ---
+def load_finetuned_model_from_hub(repo_id: str, base_model_id: str):
+    print(f"Loading LoRA adapter from Hub: {repo_id}")
+    
+    # 1. Setup 4-bit config (QLoRA)
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        # CRITICAL FIX for 70B VRAM validation error
+        llm_int8_enable_fp32_cpu_offload=True 
+    )
+
+    # 2. Load tokenizer (from the adapter repo)
+    tokenizer = AutoTokenizer.from_pretrained(repo_id, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left" 
+    
+    # 3. Load base model in 4-bit
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_model_id,
+        quantization_config=bnb_config,
+        device_map="auto",
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16
+    )
+    base_model.config.use_cache = True 
+
+    # 4. Load LoRA adapter weights on top of the base model
+    model = PeftModel.from_pretrained(
+        base_model,
+        repo_id,
+        torch_dtype=torch.bfloat16
+    )
+    
+    # model = model.merge_and_unload() # Kept commented out for VRAM safety
+    
+    print("Base model and LoRA adapter loaded successfully from Hub.")
+    
+    return model, tokenizer
+
+# ----------------------------
+# Inference function
+# ----------------------------
+@torch.no_grad()
+def run_inference(model, tokenizer, test_dataset: Dataset, max_new_tokens: int = 1024):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    results = []
+    
+    model.to(device)
+    model.eval()
+
+    print(f"Starting inference on {len(test_dataset)} examples...")
+    
+    for i, example in enumerate(test_dataset):
+        prompt = example['prompt']
+        input_ids = tokenizer(prompt, return_tensors="pt", truncation=True).input_ids.to(device)
+        
+        try:
+            generated_ids = model.generate(
+                input_ids=input_ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.eos_token_id
+            )
+            
+            new_tokens_ids = generated_ids[0][input_ids.shape[1]:]
+            generated_response = tokenizer.decode(new_tokens_ids, skip_special_tokens=True).strip()
+
+        except Exception as e:
+            print(f"Error during generation for example {i}: {e}")
+            generated_response = "ERROR DURING GENERATION"
+
+        # Record all answers
+        results.append({
+            "instruction": example['instruction'],
+            "target": example['target'],
+            "generated_response": generated_response
+        })
+        
+        if (i + 1) % 100 == 0:
+            print(f"Processed {i + 1} / {len(test_dataset)} examples...")
+            
+    print("Inference complete.")
+    return results
+
+# ----------------------------
+# Main execution
+# ----------------------------
+def main():
+    print("MentalChat16K Inference Pipeline - Loading from Hugging Face Hub (472 Questions Test Set)")
+    login(token=HF_TOKEN)
+    os.makedirs(os.path.dirname(LOCAL_RESULTS_FILE), exist_ok=True)
+    
+    # 1. Prepare Test Dataset (The 472-question split)
+    test_ds = prepare_dataset()
+    
+    # 2. Load Fine-Tuned Model from Hub
+    model, tokenizer = load_finetuned_model_from_hub(REPO_ID, BASE_MODEL)
+    
+    # 3. Run Inference
+    inference_results = run_inference(model, tokenizer, test_ds)
+    
+    # 4. Save Results Locally as JSON
+    print(f"Saving results locally to {LOCAL_RESULTS_FILE}...")
+    with open(LOCAL_RESULTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(inference_results, f, indent=2)
+
+    # 5. Upload Results to Hugging Face Hub
+    print(f"Uploading results to Hugging Face Hub: {REPO_ID}/{HF_UPLOAD_PATH}...")
+    try:
+        API.upload_file(
+            path_or_fileobj=LOCAL_RESULTS_FILE,
+            path_in_repo=HF_UPLOAD_PATH,
+            repo_id=REPO_ID,
+            repo_type="model",
+            commit_message="Add test set predictions from Hub loaded model (472 questions test split)."
+        )
+        print(f"Successfully uploaded predictions to the '{REPO_ID}' repository.")
+    except Exception as e:
+        print(f"Error uploading to Hugging Face Hub. Please check token permissions: {e}")
+
+    print("Inference and Upload Complete.")
+
+if __name__ == "__main__":
+    main()
