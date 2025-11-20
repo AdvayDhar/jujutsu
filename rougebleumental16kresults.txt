@@ -1,0 +1,43 @@
+Metric	What It Measures	Meaning of Higher Score
+ROUGE-1	Unigram (single word) overlap between generated text and reference	Better word-level similarity
+ROUGE-2	Bigram (2-word pair) overlap	Better short-phrase similarity
+ROUGE-L	Longest Common Subsequence (LCS)	Better overall sentence structure + fluency alignment
+BLEU	Precision of n-gram overlap (1-gram, 2-gram, etc.) with brevity penalty	Higher = closer to reference, penalizes too-short text
+
+LLAMA 3.1 TEST SET EVALUATION:
+
+
+- **ROUGE-1**: 0.3051
+- **ROUGE-2**: 0.1122
+- **ROUGE-L**: 0.1678
+- **BLEU**: 0.0646
+
+
+ENSEMBLE RESULTS (limited, 24 entries till now)
+
+
+CONFIG: BEST PERFORM  
+- ROUGE-1 F-Measure: 0.4131
+  - ROUGE-2 F-Measure: 0.1327
+  - ROUGE-L F-Measure: 0.2160
+  - BLEU Score:        0.0728
+
+Config: Best Fairness
+  - ROUGE-1 F-Measure: 0.4205
+  - ROUGE-2 F-Measure: 0.1288
+  - ROUGE-L F-Measure: 0.2074
+  - BLEU Score:        0.0621
+
+### Config: Best diversity
+  - ROUGE-1 F-Measure: 0.4295
+  - ROUGE-2 F-Measure: 0.1439
+  - ROUGE-L F-Measure: 0.2302
+  - BLEU Score:        0.0830
+
+### Config: Balanced output
+  - ROUGE-1 F-Measure: 0.4201
+  - ROUGE-2 F-Measure: 0.1383
+  - ROUGE-L F-Measure: 0.2195
+  - BLEU Score:        0.0812
+
+
